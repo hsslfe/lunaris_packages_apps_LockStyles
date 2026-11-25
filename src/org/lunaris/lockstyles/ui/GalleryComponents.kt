@@ -141,18 +141,12 @@ internal fun LockScreenWallpaper(
     weather: GalleryWeather.Snapshot? = null,
 ) {
     val geometry = CustomClocks.geometry(LocalContext.current)
-    val spatialScale = depthPreviewScale(wallpaper)
-    val spatialBackground = LocalDepthPreview.current?.background
+    val session = LocalDepthPreview.current
     Box(modifier) {
-        val background = Modifier.fillMaxSize().graphicsLayer {
-            transformOrigin = TransformOrigin(geometry.wallpaperPivotX / geometry.screenWidth,
-                geometry.wallpaperPivotY / geometry.screenHeight)
-            scaleX = geometry.wallpaperScale * spatialScale
-            scaleY = geometry.wallpaperScale * spatialScale
-        }
-        if (spatialBackground != null) {
-            DepthWallpaperBackground(background)
-        } else if (live) LiveWallpaper(wallpaper, background, weather)
+        val background = Modifier.fillMaxSize().depthTransform(geometry, session)
+        val appliedPhoto = session?.appliedPhoto
+        if (appliedPhoto != null) AppliedDepthPhoto(appliedPhoto, background)
+        else if (live) LiveWallpaper(wallpaper, background, weather)
         else WallpaperImage(wallpaper, background, weather)
         if (geometry.wallpaperDimAmount > 0f) {
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = geometry.wallpaperDimAmount)))

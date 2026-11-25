@@ -11,13 +11,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.net.Uri
-import android.os.ParcelFileDescriptor
+import android.graphics.Paint
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -49,21 +47,15 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import java.io.File
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.lunaris.clockmaker.ClockPreviewGeometry
 import org.lunaris.clockmaker.spatial.SpatialWallpaperDrawable
 import org.lunaris.clockmaker.spatial.SpatialWallpaperMotion
-import org.lunaris.clockmaker.spatial.SpatialWallpaperScene
 import org.lunaris.lockstyles.ClockStyle
 import org.lunaris.lockstyles.CustomClocks
 import org.lunaris.lockstyles.DynamicClocks
+import org.lunaris.lockstyles.GalleryRenderer
 import org.lunaris.lockstyles.GalleryStore
 import org.lunaris.lockstyles.GalleryWallpaper
 import org.lunaris.lockstyles.settings.Keys
@@ -82,50 +74,16 @@ internal class DepthPreviewMotion(context: Context) {
     }
 }
 
-internal data class PreparedDepthScene(val scene: SpatialWallpaperScene, val offsetX: Int, val offsetY: Int)
 internal class DepthPreviewSession(
     val geometry: ClockPreviewGeometry,
     val driver: DepthPreviewMotion,
-    val prepared: PreparedDepthScene?,
+    val spatial: Boolean,
+    val offsetX: Int,
+    val offsetY: Int,
     val foreground: SpatialWallpaperDrawable,
-    val background: SpatialWallpaperDrawable?,
+    val appliedPhoto: Bitmap?,
 )
 internal val LocalDepthPreview = staticCompositionLocalOf<DepthPreviewSession?> { null }
-
-private object DepthPreviewCache {
-    private data class Key(val uri: Uri, val revision: Long)
-    private val guard = Any()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val completed = LinkedHashMap<Key, SpatialWallpaperScene>(4, 0.75f, true)
-    private val pending = mutableMapOf<Key, Deferred<SpatialWallpaperScene?>>()
-
-    suspend fun load(context: Context, uri: Uri, revision: Long): SpatialWallpaperScene? {
-        val key = Key(uri, revision)
-        val work = synchronized(guard) {
-            completed[key]?.let { return it }
-            pending[key] ?: scope.async(start = CoroutineStart.LAZY) {
-                var result: SpatialWallpaperScene? = null
-                try {
-                    result = runCatching {
-                        context.contentResolver.openFileDescriptor(uri, "r")
-                            ?.let { SpatialWallpaperScene.read(it) }
-                    }.getOrNull()
-                    result
-                } finally {
-                    synchronized(guard) {
-                        pending.remove(key)
-                        result?.let { completed[key] = it }
-                        while (completed.size > 2) completed.remove(completed.keys.first())
-                    }
-                }
-            }.also {
-                pending[key] = it
-                it.start()
-            }
-        }
-        return work.await()
-    }
-}
 
 private fun matchesDepthWallpaper(context: Context, wallpaper: GalleryWallpaper?): Boolean {
     if (wallpaper == null) return true
@@ -143,13 +101,10 @@ internal fun rememberDepthPreview(wallpaper: GalleryWallpaper?, enabled: Boolean
     if (!enabled || !depth || path.isNullOrEmpty() || !matchesDepthWallpaper(context, wallpaper)) return null
     val subjectPath = path ?: return null
     val spatial by Keys.DEPTH_SPATIAL.state()
-    val sensitivity by Keys.DEPTH_SPATIAL_SENSITIVITY.state()
     val offsetX by Keys.DEPTH_OFFSET_X.state()
     val offsetY by Keys.DEPTH_OFFSET_Y.state()
+    val sensitivity by Keys.DEPTH_SPATIAL_SENSITIVITY.state()
     val geometry = CustomClocks.geometry(context)
-    val wm = remember(context) { WallpaperManager.getInstance(context) }
-    val wallpaperId = wm.getWallpaperId(WallpaperManager.FLAG_LOCK).takeIf { it > 0 }
-        ?: wm.getWallpaperId(WallpaperManager.FLAG_SYSTEM)
     val revision = File(subjectPath).lastModified()
     val raw by key(subjectPath, revision, geometry.screenWidth, geometry.screenHeight) {
         produceState<Bitmap?>(null) {
@@ -168,21 +123,28 @@ internal fun rememberDepthPreview(wallpaper: GalleryWallpaper?, enabled: Boolean
             }
         }
     }
-    val uri = SpatialWallpaperScene.request(subjectPath, wallpaperId, geometry.screenWidth,
-        geometry.screenHeight, geometry.density, offsetX, offsetY)
-    val prepared by key(subjectPath, revision, wallpaperId, spatial, geometry.screenWidth, geometry.screenHeight) {
-        produceState<PreparedDepthScene?>(null, uri) {
-            if (spatial) {
-                delay(150)
-                DepthPreviewCache.load(context.applicationContext, uri, revision)?.let {
-                    value = PreparedDepthScene(it, offsetX, offsetY)
+    // Extraction uses the installed wallpaper. Rendering the gallery source again can
+    // yield a different crop from the one baked into the transparent subject.
+    val wm = remember(context) { WallpaperManager.getInstance(context) }
+    val lockId = wm.getWallpaperId(WallpaperManager.FLAG_LOCK)
+    val flag = if (lockId > 0) WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
+    val wallpaperId = if (lockId > 0) lockId else wm.getWallpaperId(flag)
+    val appliedPhoto by key(flag, wallpaperId, subjectPath, revision) {
+        produceState<Bitmap?>(null, spatial, wallpaper?.effect) {
+            value = if (spatial && (wallpaper?.effect ?: 0) == 0) {
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        wm.getWallpaperFile(flag)?.use {
+                            BitmapFactory.decodeFileDescriptor(it.fileDescriptor)
+                        }
+                    }.getOrNull()
                 }
-            }
+            } else null
         }
     }
     val driver = remember(context, subjectPath) { DepthPreviewMotion(context) }
     val lifecycle = rememberWidgetLifecycle()
-    val moving = spatial && prepared != null && raw != null
+    val moving = spatial && raw != null
     SideEffect { driver.motion.setSensitivity(sensitivity) }
     DisposableEffect(driver) { onDispose { driver.motion.destroy() } }
     DisposableEffect(driver, lifecycle, moving) {
@@ -212,18 +174,8 @@ internal fun rememberDepthPreview(wallpaper: GalleryWallpaper?, enabled: Boolean
             driver.motion.setActive(false, false)
         }
     }
-    return remember(raw, prepared, driver, geometry) {
-        val bitmap = raw ?: return@remember null
-        val scene = prepared?.scene
-        val foreground = SpatialWallpaperDrawable(bitmap, scene?.subjectDepth,
-            scene?.depthWidth ?: 0, scene?.depthHeight ?: 0)
-        val background = scene?.let {
-            SpatialWallpaperDrawable(it.background, it.backgroundDepth, it.depthWidth, it.depthHeight).apply {
-                setSubjectUnderlay(bitmap, it.subjectDepth, it.depthWidth, it.depthHeight)
-            }
-        }
-        DepthPreviewSession(geometry, driver, prepared, foreground, background)
-    }
+    val foreground = remember(raw) { raw?.let { SpatialWallpaperDrawable(it, null, 0, 0) } }
+    return foreground?.let { DepthPreviewSession(geometry, driver, spatial, offsetX, offsetY, it, appliedPhoto) }
 }
 
 @Composable
@@ -233,54 +185,53 @@ internal fun DepthPreviewProvider(wallpaper: GalleryWallpaper?, enabled: Boolean
     CompositionLocalProvider(LocalDepthPreview provides session, content = content)
 }
 
+internal fun Modifier.depthTransform(
+    geometry: ClockPreviewGeometry,
+    session: DepthPreviewSession?,
+): Modifier = graphicsLayer {
+    transformOrigin = TransformOrigin(geometry.wallpaperPivotX / geometry.screenWidth,
+        geometry.wallpaperPivotY / geometry.screenHeight)
+    val driver = session?.driver
+    scaleX = geometry.wallpaperScale * (driver?.scale ?: 1f)
+    scaleY = scaleX
+    val pxPerDpX = geometry.density * size.width / geometry.screenWidth
+    val pxPerDpY = geometry.density * size.height / geometry.screenHeight
+    val offsetX = if (session?.spatial == true) session.offsetX * scaleX else 0f
+    val offsetY = if (session?.spatial == true) session.offsetY * scaleY else 0f
+    translationX = ((driver?.horizontal ?: 0f) * 12f + offsetX) * pxPerDpX
+    translationY = ((driver?.vertical ?: 0f) * 9f + offsetY) * pxPerDpY
+}
+
 @Composable
-internal fun depthPreviewScale(wallpaper: GalleryWallpaper? = null): Float =
-    LocalDepthPreview.current?.driver?.scale ?: 1f
+internal fun AppliedDepthPhoto(bitmap: Bitmap, modifier: Modifier) {
+    val paint = remember { Paint(Paint.FILTER_BITMAP_FLAG) }
+    Canvas(modifier) {
+        drawIntoCanvas {
+            GalleryRenderer.drawCentreCrop(it.nativeCanvas, bitmap, size.width, size.height, paint)
+        }
+    }
+}
 
 @Composable
 internal fun DepthWallpaperLayer(wallpaper: GalleryWallpaper? = null) {
     val session = LocalDepthPreview.current ?: return
     val geometry = session.geometry
     val opacity by Keys.DEPTH_OPACITY.state()
-    val offsetX by Keys.DEPTH_OFFSET_X.state()
-    val offsetY by Keys.DEPTH_OFFSET_Y.state()
     val fade by Keys.DEPTH_BOTTOM_FADE.state()
     val inset by Keys.DEPTH_BOTTOM_INSET.state()
     val curve by Keys.DEPTH_FADE_CURVE.state()
-    Canvas(Modifier.fillMaxSize().graphicsLayer {
-        transformOrigin = TransformOrigin(geometry.wallpaperPivotX / geometry.screenWidth,
-            geometry.wallpaperPivotY / geometry.screenHeight)
-        scaleX = geometry.wallpaperScale * session.driver.scale
-        scaleY = geometry.wallpaperScale * session.driver.scale
-    }) {
+    Canvas(Modifier.fillMaxSize().depthTransform(geometry, session)) {
         val drawable = session.foreground
         drawable.setBounds(0, 0, size.width.toInt(), size.height.toInt())
-        drawable.setImagePlacement(offsetX * geometry.density, offsetY * geometry.density, true)
-        drawable.setDepthOffset((offsetX - (session.prepared?.offsetX ?: offsetX)) * geometry.density / size.width,
-            (offsetY - (session.prepared?.offsetY ?: offsetY)) * geometry.density / size.height)
+        drawable.setImagePlacement(
+            if (session.spatial) 0f else session.offsetX * geometry.density,
+            if (session.spatial) 0f else session.offsetY * geometry.density,
+            true,
+        )
         drawable.setFadeHeightPx((fade.coerceAtLeast(0) * geometry.density).roundToInt())
         drawable.setBottomInsetPx((inset.coerceAtLeast(0) * geometry.density).roundToInt())
         drawable.setFadeCurveExponent(0.2f + curve.coerceIn(0, 100) / 100f * 0.8f)
         drawable.alpha = (opacity.coerceIn(0, 100) * 2.55f).roundToInt().coerceIn(0, 255)
-        drawable.setTilt(session.driver.horizontal, session.driver.vertical)
-        drawIntoCanvas { drawable.draw(it.nativeCanvas) }
-    }
-}
-
-@Composable
-internal fun DepthWallpaperBackground(modifier: Modifier) {
-    val session = LocalDepthPreview.current ?: return
-    val drawable = session.background ?: return
-    val offsetX by Keys.DEPTH_OFFSET_X.state()
-    val offsetY by Keys.DEPTH_OFFSET_Y.state()
-    Canvas(modifier) {
-        drawable.setBounds(0, 0, size.width.toInt(), size.height.toInt())
-        drawable.subjectUnderlay?.apply {
-            setImagePlacement(offsetX * session.geometry.density, offsetY * session.geometry.density, true)
-            setDepthOffset((offsetX - (session.prepared?.offsetX ?: offsetX)) * session.geometry.density / size.width,
-                (offsetY - (session.prepared?.offsetY ?: offsetY)) * session.geometry.density / size.height)
-        }
-        drawable.setTilt(session.driver.horizontal, session.driver.vertical)
         drawIntoCanvas { drawable.draw(it.nativeCanvas) }
     }
 }
@@ -317,14 +268,13 @@ internal fun DepthWallpaperPreview() {
             .clip(MaterialTheme.shapes.extraLarge).background(Color.Black)) {
             LockScreenPreviewLayout(Modifier.fillMaxSize(), showDepth = true) {
                 val session = LocalDepthPreview.current
-                val background = Modifier.fillMaxSize().graphicsLayer {
-                    transformOrigin = TransformOrigin(geometry.wallpaperPivotX / geometry.screenWidth,
-                        geometry.wallpaperPivotY / geometry.screenHeight)
-                    scaleX = geometry.wallpaperScale * (session?.driver?.scale ?: 1f)
-                    scaleY = geometry.wallpaperScale * (session?.driver?.scale ?: 1f)
+                val background = Modifier.fillMaxSize().depthTransform(geometry, session)
+                val appliedPhoto = session?.appliedPhoto
+                if (appliedPhoto != null) {
+                    AppliedDepthPhoto(appliedPhoto, background)
+                } else {
+                    bitmap?.let { Image(it.asImageBitmap(), null, background, contentScale = ContentScale.Crop) }
                 }
-                if (session?.background != null) DepthWallpaperBackground(background)
-                else bitmap?.let { Image(it.asImageBitmap(), null, background, contentScale = ContentScale.Crop) }
                 if (geometry.wallpaperDimAmount > 0f)
                     Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = geometry.wallpaperDimAmount)))
                 Box(Modifier.fillMaxSize().background(Color(geometry.wallpaperScrimColor)))

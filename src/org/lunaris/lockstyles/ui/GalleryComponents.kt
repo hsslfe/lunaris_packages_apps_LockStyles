@@ -115,20 +115,29 @@ fun WallpaperImage(
         val h = with(density) { maxHeight.roundToPx() }.coerceAtLeast(1)
         // The last one stays up until the next is drawn, so switching crossfades rather than
         // flashing empty, e.g. while scrolling through variants.
-        var bitmap by remember { mutableStateOf<Bitmap?>(null) }
-        LaunchedEffect(wallpaper, w, h, weather) {
+        val cache = LocalGalleryPreviewCache.current
+        val photoKey = if (cache != null) photoPreviewKey(wallpaper, w, h) else null
+        val renderWeather = if (wallpaper.kind == GalleryWallpaper.Kind.PHOTO) null else weather
+        var bitmap by remember(cache) { mutableStateOf(photoKey?.let { cache?.get(it)?.background }) }
+        LaunchedEffect(wallpaper, w, h, renderWeather, photoKey, cache) {
             bitmap = withContext(Dispatchers.Default) {
-                Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
+                val cached = if (photoKey != null && cache != null)
+                    loadPhotoPreview(context, photoKey, cache) else null
+                cached ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
                     GalleryRenderer.draw(context, android.graphics.Canvas(it), wallpaper, w, h,
-                        weather = weather)
+                        weather = renderWeather)
                 }
             }
         }
-        Crossfade(bitmap, animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(), label = "wallpaper") { shown ->
-            shown?.let {
-                Image(it.asImageBitmap(), null, Modifier.fillMaxSize(),
+        // Never crossfade a ready wallpaper in from an empty placeholder.
+        val ready = bitmap
+        if (ready == null) {
+            Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHigh))
+        } else {
+            Crossfade(ready, animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(), label = "wallpaper") { shown ->
+                Image(shown.asImageBitmap(), null, Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop)
-            } ?: Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHigh))
+            }
         }
     }
 }
@@ -395,6 +404,7 @@ fun CustomClockLayer(
     onBottomChanged: ((ClockPreviewBounds) -> Unit)? = null,
     wallpaper: GalleryWallpaper? = null,
     homeScreen: Boolean = false,
+    immediatePreview: Boolean = false,
 ) {
     val context = LocalContext.current
     val fallbackTuning = remember { CustomClocks.Tuning.load(context) }
@@ -421,16 +431,24 @@ fun CustomClockLayer(
     val holdForGlass = holdPreview(wantGlass && wallpaper != null, glass != null, wallpaper)
     val assetsSeq = configuration.assetsSeq
     val minute = previewMinute()
-    val preview by produceState<Bitmap?>(null, style.face, style.font, style.small, style.preset,
+    val stockStyle = style.takeIf { it.face == 0 }
+    fun renderPreview() = CustomClocks.preview(context, style.face, frame.width, color,
+        tuning = currentTuning, glassBackground = glass, homeScreen = homeScreen,
+        font = style.font, stockStyle = stockStyle)
+
+    // The pager, moving card and editor have separate compositions. Seed each
+    // with the same full-size cached clock instead of drawing an empty frame.
+    // Only the editor needs a synchronous fallback if its initial key is new.
+    var preview by remember {
+        mutableStateOf(if (holdForGlass) null else
+            CustomClocks.cachedPreview(context, style.face, frame.width, color,
+                currentTuning, glass, homeScreen, style.font, stockStyle)
+                ?: if (immediatePreview) renderPreview() else null)
+    }
+    LaunchedEffect(style.face, style.font, style.small, style.preset,
         style.rounded, style.stockAxes, color, frame.width, currentTuning,
         glass, holdForGlass, assetsSeq, homeScreen, geometry, minute) {
-        if (holdForGlass) {
-            value = null
-            return@produceState
-        }
-        value = CustomClocks.preview(context, style.face, frame.width, color, tuning = currentTuning,
-            glassBackground = glass, homeScreen = homeScreen, font = style.font,
-            stockStyle = style.takeIf { it.face == 0 })
+        preview = if (holdForGlass) null else renderPreview()
     }
     BoxWithConstraints(modifier.fillMaxSize()) {
         val bitmap = preview ?: return@BoxWithConstraints

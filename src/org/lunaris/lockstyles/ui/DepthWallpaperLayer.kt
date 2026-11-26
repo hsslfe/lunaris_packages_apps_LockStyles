@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Paint
+import android.os.PowerManager
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -24,14 +25,18 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -74,6 +79,82 @@ internal class DepthPreviewMotion(context: Context) {
     }
 }
 
+// The switcher card, zooming copy and editor all represent the same installed
+// depth wallpaper. Share its motion state across those composition boundaries.
+private class GalleryDepthMotion(context: Context) {
+    val driver = DepthPreviewMotion(context)
+    var consumers by mutableIntStateOf(0)
+        private set
+
+    fun acquire() { consumers++ }
+    fun release() { consumers-- }
+}
+
+private val LocalGalleryDepthMotion = staticCompositionLocalOf<GalleryDepthMotion?> { null }
+
+@Composable
+internal fun GalleryPreviewScope(cache: GalleryPreviewCache, content: @Composable () -> Unit) {
+    val context = LocalContext.current
+    val shared = remember(context) { GalleryDepthMotion(context) }
+    val sensitivity by Keys.DEPTH_SPATIAL_SENSITIVITY.state()
+    SideEffect { shared.driver.motion.setSensitivity(sensitivity) }
+    BindDepthMotion(shared.driver, shared.consumers > 0)
+    CompositionLocalProvider(
+        LocalGalleryPreviewCache provides cache,
+        LocalGalleryDepthMotion provides shared,
+        content = content,
+    )
+}
+
+/** Keep one sensor listener for the shared scene and stop it as soon as it is no longer visible. */
+@Composable
+private fun BindDepthMotion(driver: DepthPreviewMotion, moving: Boolean) {
+    val context = LocalContext.current
+    val lifecycle = rememberWidgetLifecycle()
+    val power = remember(context) { context.getSystemService(PowerManager::class.java) }
+    val wantsMotion by rememberUpdatedState(moving)
+
+    fun refresh(animate: Boolean) {
+        driver.motion.setActive(
+            wantsMotion && power?.isInteractive == true &&
+                lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+            animate,
+        )
+    }
+
+    DisposableEffect(driver, lifecycle, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) refresh(false)
+            else if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP)
+                driver.motion.setActive(false, false)
+        }
+        val screen = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == Intent.ACTION_SCREEN_OFF) driver.motion.setActive(false, false)
+                else refresh(false)
+            }
+        }
+        lifecycle.addObserver(observer)
+        context.registerReceiver(screen, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }, Context.RECEIVER_NOT_EXPORTED)
+        onDispose {
+            context.unregisterReceiver(screen)
+            lifecycle.removeObserver(observer)
+            driver.motion.destroy()
+        }
+    }
+    LaunchedEffect(driver, lifecycle, moving) {
+        // The outgoing preview may release just before the incoming preview
+        // acquires. Do not reset the spatial zoom during that single frame.
+        if (!moving) withFrameNanos { }
+        // The gallery transition already animates the scene. Start at full
+        // spatial overscan instead of adding a second, tilt-attenuating ramp.
+        refresh(false)
+    }
+}
+
 internal class DepthPreviewSession(
     val geometry: ClockPreviewGeometry,
     val driver: DepthPreviewMotion,
@@ -105,74 +186,33 @@ internal fun rememberDepthPreview(wallpaper: GalleryWallpaper?, enabled: Boolean
     val offsetY by Keys.DEPTH_OFFSET_Y.state()
     val sensitivity by Keys.DEPTH_SPATIAL_SENSITIVITY.state()
     val geometry = CustomClocks.geometry(context)
-    val revision = File(subjectPath).lastModified()
-    val raw by key(subjectPath, revision, geometry.screenWidth, geometry.screenHeight) {
-        produceState<Bitmap?>(null) {
-            value = withContext(Dispatchers.IO) {
-                runCatching {
-                    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    BitmapFactory.decodeFile(subjectPath, options)
-                    var sample = 1
-                    while (options.outWidth / (sample * 2) >= geometry.screenWidth &&
-                        options.outHeight / (sample * 2) >= geometry.screenHeight) sample *= 2
-                    options.inSampleSize = sample
-                    options.inJustDecodeBounds = false
-                    options.inPreferredConfig = Bitmap.Config.ARGB_8888
-                    BitmapFactory.decodeFile(subjectPath, options)
-                }.getOrNull()
+    // Publish the aligned photo and cutout together, including on the first
+    // composition after handing off between the card and the editor.
+    val cache = LocalGalleryPreviewCache.current
+    val assetKey = depthPreviewKey(context, subjectPath, geometry,
+        spatial && (wallpaper?.effect ?: 0) == 0)
+    val assets by key(assetKey, cache) {
+        produceState(cache?.get(assetKey)) {
+            if (value == null) value = withContext(Dispatchers.IO) {
+                loadDepthPreview(context, assetKey, cache)
             }
         }
     }
-    // Extraction uses the installed wallpaper. Rendering the gallery source again can
-    // yield a different crop from the one baked into the transparent subject.
-    val wm = remember(context) { WallpaperManager.getInstance(context) }
-    val lockId = wm.getWallpaperId(WallpaperManager.FLAG_LOCK)
-    val flag = if (lockId > 0) WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
-    val wallpaperId = if (lockId > 0) lockId else wm.getWallpaperId(flag)
-    val appliedPhoto by key(flag, wallpaperId, subjectPath, revision) {
-        produceState<Bitmap?>(null, spatial, wallpaper?.effect) {
-            value = if (spatial && (wallpaper?.effect ?: 0) == 0) {
-                withContext(Dispatchers.IO) {
-                    runCatching {
-                        wm.getWallpaperFile(flag)?.use {
-                            BitmapFactory.decodeFileDescriptor(it.fileDescriptor)
-                        }
-                    }.getOrNull()
-                }
-            } else null
-        }
-    }
-    val driver = remember(context, subjectPath) { DepthPreviewMotion(context) }
-    val lifecycle = rememberWidgetLifecycle()
+    val raw = assets?.foreground
+    val appliedPhoto = assets?.background
+    val shared = LocalGalleryDepthMotion.current
     val moving = spatial && raw != null
-    SideEffect { driver.motion.setSensitivity(sensitivity) }
-    DisposableEffect(driver) { onDispose { driver.motion.destroy() } }
-    DisposableEffect(driver, lifecycle, moving) {
-        fun refresh(animate: Boolean) {
-            driver.motion.setActive(moving && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED), animate)
+    val driver = if (shared != null) {
+        DisposableEffect(shared, moving) {
+            if (moving) shared.acquire()
+            onDispose { if (moving) shared.release() }
         }
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) refresh(true)
-            else if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP)
-                driver.motion.setActive(false, false)
-        }
-        val screen = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == Intent.ACTION_SCREEN_OFF) driver.motion.setActive(false, false)
-                else refresh(true)
-            }
-        }
-        lifecycle.addObserver(observer)
-        context.registerReceiver(screen, IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(Intent.ACTION_SCREEN_ON)
-        }, Context.RECEIVER_NOT_EXPORTED)
-        refresh(true)
-        onDispose {
-            context.unregisterReceiver(screen)
-            lifecycle.removeObserver(observer)
-            driver.motion.setActive(false, false)
-        }
+        shared.driver
+    } else {
+        val local = remember(context, subjectPath) { DepthPreviewMotion(context) }
+        SideEffect { local.motion.setSensitivity(sensitivity) }
+        BindDepthMotion(local, moving)
+        local
     }
     val foreground = remember(raw) { raw?.let { SpatialWallpaperDrawable(it, null, 0, 0) } }
     return foreground?.let { DepthPreviewSession(geometry, driver, spatial, offsetX, offsetY, it, appliedPhoto) }
@@ -191,7 +231,7 @@ internal fun Modifier.depthTransform(
 ): Modifier = graphicsLayer {
     transformOrigin = TransformOrigin(geometry.wallpaperPivotX / geometry.screenWidth,
         geometry.wallpaperPivotY / geometry.screenHeight)
-    val driver = session?.driver
+    val driver = session?.takeIf { it.spatial }?.driver
     scaleX = geometry.wallpaperScale * (driver?.scale ?: 1f)
     scaleY = scaleX
     val pxPerDpX = geometry.density * size.width / geometry.screenWidth

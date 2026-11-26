@@ -242,7 +242,8 @@ private fun CustomiseContent(
                 val previewClock = if (previewDynamic) dynamicClock.large else clock
                 val previewTuning = if (previewDynamic) previewClock.tuning ?: tuning else tuning
                 if (previewClock.face > 0 || previewDynamic) {
-                    CustomClockLayer(previewClock, tuning = previewTuning, wallpaper = wallpaper, onBottomChanged = { clockBottom = it })
+                    CustomClockLayer(previewClock, tuning = previewTuning, wallpaper = wallpaper,
+                        immediatePreview = true, onBottomChanged = { clockBottom = it })
                     Box(Modifier.fillMaxWidth().fillMaxHeight(0.3f)
                         .semantics { contentDescription = editClockLabel }
                         .clickable(onClickLabel = editClockLabel) { openPanel(CustomizerTab.CLOCK) })

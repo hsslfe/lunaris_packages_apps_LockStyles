@@ -12,6 +12,8 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
+import android.view.ViewTreeObserver
 import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
@@ -33,6 +35,8 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
@@ -40,6 +44,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -93,6 +98,8 @@ class LockScreenGalleryActivity : ComponentActivity() {
     private var launchRequest by mutableStateOf(LaunchRequest(false, false, false, 0))
     private var deviceLocked by mutableStateOf(false)
     private var initializing by mutableStateOf(true)
+    private var firstPreviewComposed = false
+    private var previewCache by mutableStateOf(GalleryPreviewCache())
 
     private data class LaunchRequest(
         val fromLockScreen: Boolean,
@@ -129,6 +136,7 @@ class LockScreenGalleryActivity : ComponentActivity() {
         updateWindowForEntry()
         val store = GalleryStore.get(this)
         val generation = launchGeneration
+        val cache = previewCache
         lifecycleScope.launch {
             try {
                 withContext(Dispatchers.IO) {
@@ -136,21 +144,25 @@ class LockScreenGalleryActivity : ComponentActivity() {
                         CustomClocks.refreshPreviewGeometry(this@LockScreenGalleryActivity)
                         adoptCurrentWallpaper(store)
                         store.syncCurrentSettings()
+                        prepareGalleryPreview(this@LockScreenGalleryActivity, store, cache)
                     }
                 }
             } finally {
                 if (launchGeneration == generation) initializing = false
             }
         }
+        if (launchRequest.fromLockScreen) deferInitialPreviewDraw()
         setContent {
             if (initializing) {
-                LockStylesTheme { GalleryProgress(R.string.gallery_loading) }
+                LockStylesTheme { GalleryStartupProgress() }
                 return@setContent
             }
             val request = launchRequest
+            SideEffect { firstPreviewComposed = true }
             // A new singleTask intent must discard the previous editor immediately. In
             // particular, do not animate an old photo-backed editor into a locked entry.
             key(request.generation) {
+                GalleryPreviewScope(previewCache) {
                 LockStylesTheme {
                     var screen by remember {
                         val current = store.lockScreens.firstOrNull { it.id == store.currentId }
@@ -445,6 +457,7 @@ class LockScreenGalleryActivity : ComponentActivity() {
         }
     }
     }
+    }
 
     override fun onStart() {
         super.onStart()
@@ -475,13 +488,17 @@ class LockScreenGalleryActivity : ComponentActivity() {
         launchRequest = requestFor(intent, ++launchGeneration)
         updateWindowForEntry()
         initializing = true
+        previewCache = GalleryPreviewCache()
         val generation = launchGeneration
+        val cache = previewCache
         lifecycleScope.launch {
             try {
                 withContext(Dispatchers.IO) {
                     applyMutex.withLock {
                         CustomClocks.refreshPreviewGeometry(this@LockScreenGalleryActivity)
-                        GalleryStore.get(this@LockScreenGalleryActivity).syncCurrentSettings()
+                        val store = GalleryStore.get(this@LockScreenGalleryActivity)
+                        store.syncCurrentSettings()
+                        prepareGalleryPreview(this@LockScreenGalleryActivity, store, cache)
                     }
                 }
             } finally {
@@ -496,6 +513,28 @@ class LockScreenGalleryActivity : ComponentActivity() {
         startInClock = intent.action == ACTION_LOCK_SCREEN_CLOCK,
         generation = generation,
     )
+
+    // Keep the first window buffer from being the loading screen during a cold
+    // locked launch. WM can then hand off to the actual preview in one transition.
+    // Bound the gate so a slow or failed preview never blocks window drawing indefinitely.
+    private fun deferInitialPreviewDraw() {
+        val decor = window.decorView
+        val deadline = SystemClock.uptimeMillis() + 700L
+        val listener = object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (firstPreviewComposed || SystemClock.uptimeMillis() >= deadline ||
+                    isFinishing || isDestroyed) {
+                    if (decor.viewTreeObserver.isAlive) {
+                        decor.viewTreeObserver.removeOnPreDrawListener(this)
+                    }
+                    return true
+                }
+                decor.postInvalidateOnAnimation()
+                return false
+            }
+        }
+        decor.viewTreeObserver.addOnPreDrawListener(listener)
+    }
 
     private fun drawBehindSystemBars() {
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -705,6 +744,21 @@ class LockScreenGalleryActivity : ComponentActivity() {
         private const val MAX_SHUFFLE = 30
         private const val FEATURED = 6
         private val applyMutex = Mutex()
+    }
+}
+
+// Keep launch loading inside the activity window. A dimming dialog creates a
+// second window transition while keyguard is being occluded.
+@Composable
+private fun GalleryStartupProgress() {
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+        Box(contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                ExpressiveLoadingIndicator()
+                Text(stringResource(R.string.gallery_loading), style = MaterialTheme.typography.bodyLarge)
+            }
+        }
     }
 }
 

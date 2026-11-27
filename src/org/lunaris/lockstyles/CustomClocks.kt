@@ -448,6 +448,23 @@ object CustomClocks {
         )
     }
 
+    private fun previewKey(context: Context, style: Int, width: Int, color: Int?,
+            trim: Boolean, tuning: Tuning?, glassBackground: ClockGlass?, homeScreen: Boolean,
+            font: String?, stockStyle: ClockStyle?): String {
+        val minute = System.currentTimeMillis() / 60_000
+        val assetsSeq = context.resources.configuration.assetsSeq
+        val geometry = geometry(context, homeScreen)
+        val stockKey = stockStyle?.let { "${it.small}/${it.preset}/${it.rounded}/${it.stockAxes}" }.orEmpty()
+        return "$style/$width/$color/$minute/$trim/$tuning/$assetsSeq/$homeScreen/$geometry/$font/$stockKey/${System.identityHashCode(glassBackground)}"
+    }
+
+    // A new preview owner can display an already rendered clock on its first frame.
+    internal fun cachedPreview(context: Context, style: Int, width: Int, color: Int?,
+            tuning: Tuning?, glassBackground: ClockGlass?, homeScreen: Boolean,
+            font: String?, stockStyle: ClockStyle?): Bitmap? =
+        previews.get(previewKey(context, style, width, color, false, tuning, glassBackground,
+            homeScreen, font, stockStyle))
+
     /**
      * The style drawn at [width] pixels with the current time, or null for the default clock.
      * [trim] crops the empty space around it, for small tiles.
@@ -456,11 +473,9 @@ object CustomClocks {
             trim: Boolean = false, tuning: Tuning? = null, glassBackground: ClockGlass? = null,
             homeScreen: Boolean = false, font: String? = null, stockStyle: ClockStyle? = null): Bitmap? {
         if (style < 0) return null
-        val minute = System.currentTimeMillis() / 60_000
-        val assetsSeq = context.resources.configuration.assetsSeq
         val geometry = geometry(context, homeScreen)
-        val stockKey = stockStyle?.let { "${it.small}/${it.preset}/${it.rounded}/${it.stockAxes}" }.orEmpty()
-        val key = "$style/$width/$color/$minute/$trim/$tuning/$assetsSeq/$homeScreen/$geometry/$font/$stockKey/${System.identityHashCode(glassBackground)}"
+        val key = previewKey(context, style, width, color, trim, tuning, glassBackground,
+            homeScreen, font, stockStyle)
         previews.get(key)?.let { return it }
         val cat = load(context) ?: return null
         if (style >= cat.layouts.size) return null

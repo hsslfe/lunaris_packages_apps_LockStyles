@@ -4,6 +4,8 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -65,6 +67,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.contentDescription
@@ -73,9 +76,12 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.math.min
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import org.lunaris.lockstyles.GalleryRenderer
 import org.lunaris.lockstyles.CustomClocks
 import org.lunaris.lockstyles.GalleryStore
@@ -119,6 +125,7 @@ fun SwitcherScreen(
     onClock: (LockScreen) -> Unit,
 ) {
     val aspect = CustomClocks.geometry(LocalContext.current).aspect
+    val view = LocalView.current
     var changes by remember { mutableIntStateOf(0) }
     DisposableEffect(store) {
         val listener: () -> Unit = { changes++ }
@@ -135,18 +142,47 @@ fun SwitcherScreen(
     val zoom = remember { Animatable(if (zoomIn) 1f else 0f) }
     var cardBounds by remember { mutableStateOf<Rect?>(null) }
     var zooming by remember { mutableStateOf<LockScreen?>(null) }
+    var entering by remember { mutableStateOf(zoomIn) }
     val spring = MaterialTheme.motionScheme.defaultSpatialSpec<Float>()
     val fastSpring = MaterialTheme.motionScheme.fastSpatialSpec<Float>()
+    // A monotonic handoff avoids the clipped overshoot of the general spatial spring.
+    val entryMotion = remember {
+        tween<Float>(durationMillis = 420, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+    }
     val effects = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     val fastEffectsColor = MaterialTheme.motionScheme.fastEffectsSpec<androidx.compose.ui.graphics.Color>()
-    val interactive = zoom.value == 0f && zooming == null && !pager.isScrollInProgress
+    val transitioning = entering || zooming != null
+    val interactive = !transitioning && !pager.isScrollInProgress
 
-    LaunchedEffect(lockScreens.isEmpty()) {
-        if (lockScreens.isEmpty()) zoom.snapTo(0f)
-    }
-
-    LaunchedEffect(cardBounds != null) {
-        if (cardBounds != null && zoom.value > 0f && zooming == null) zoom.animateTo(0f, spring)
+    LaunchedEffect(lockScreens.isEmpty(), cardBounds != null) {
+        if (lockScreens.isEmpty()) {
+            zoom.snapTo(0f)
+            entering = false
+        } else if (entering && cardBounds != null) {
+            // Submit the full-size preview before moving it. Layout readiness alone
+            // does not mean the first frame has reached the rendering pipeline.
+            if (view.isHardwareAccelerated && view.isAttachedToWindow) {
+                withTimeoutOrNull(250L) {
+                    suspendCancellableCoroutine<Unit> { continuation ->
+                        val observer = view.viewTreeObserver
+                        val callback = Runnable {
+                            if (continuation.isActive) continuation.resume(Unit)
+                        }
+                        if (observer.isAlive) {
+                            observer.registerFrameCommitCallback(callback)
+                            continuation.invokeOnCancellation {
+                                if (observer.isAlive) observer.unregisterFrameCommitCallback(callback)
+                            }
+                            view.postInvalidateOnAnimation()
+                        } else {
+                            continuation.resume(Unit)
+                        }
+                    }
+                }
+            }
+            zoom.animateTo(0f, entryMotion)
+            entering = false
+        }
     }
 
     LaunchedEffect(version) {
@@ -168,7 +204,12 @@ fun SwitcherScreen(
     BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) {
         val fullWidth = constraints.maxWidth.toFloat()
         val fullHeight = constraints.maxHeight.toFloat()
-        val chrome = (1f - zoom.value).coerceIn(0f, 1f)
+        val reveal = (1f - zoom.value).coerceIn(0f, 1f)
+        // Keep gallery controls behind the moving preview until it clears their bounds.
+        val chrome = if (entering) {
+            val fraction = ((reveal - 0.25f) / 0.75f).coerceIn(0f, 1f)
+            fraction * fraction * (3f - 2f * fraction)
+        } else reveal
         val stackedActions = maxWidth < 360.dp || LocalDensity.current.fontScale > 1.3f
         val scrollContent = maxHeight < 600.dp || stackedActions
         val previewHeight = (maxHeight * 0.6f).coerceAtLeast(180.dp)
@@ -261,7 +302,7 @@ fun SwitcherScreen(
                     key = { lockScreens[it].id },
                     contentPadding = PaddingValues(horizontal = 40.dp),
                     pageSpacing = 20.dp,
-                    userScrollEnabled = zoom.value == 0f && zooming == null,
+                    userScrollEnabled = !transitioning,
                     modifier = previewModifier,
                 ) { page ->
                     val lockScreen = lockScreens[page]
@@ -330,7 +371,7 @@ fun SwitcherScreen(
                                     scaleX = scale
                                     scaleY = scale
                                     // The zooming copy stands in for the current card.
-                                    alpha = if (isCurrent && zoom.value > 0f) 0f
+                                    alpha = if (isCurrent && transitioning) 0f
                                     else if (isCurrent) 1f else chrome
                                 }
                                 .pointerInput(lockScreen.id, interactive, isCurrent) {
@@ -419,7 +460,8 @@ fun SwitcherScreen(
         // Until the card has been laid out, the lock screen simply fills the display.
         val card = cardBounds ?: Rect(0f, 0f, fullWidth, fullHeight)
         val moving = zooming ?: lockScreens.getOrNull(pager.currentPage)
-        if (moving != null && zoom.value > 0f) {
+        // Keep one visible owner throughout the spring, including any overshoot.
+        if (moving != null && transitioning) {
             val t = zoom.value.coerceIn(0f, 1f)
             val left = card.left * (1 - t)
             val top = card.top * (1 - t)

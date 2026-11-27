@@ -83,18 +83,28 @@ internal fun loadDepthPreview(context: Context, key: DepthPreviewKey,
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(key.subjectPath, options)
         var sample = 1
+        // Only sample by exact divisors: rounding one dimension changes the
+        // cutout's aspect ratio and shifts it against the original photo.
         while (options.outWidth / (sample * 2) >= key.width &&
-            options.outHeight / (sample * 2) >= key.height) sample *= 2
+            options.outHeight / (sample * 2) >= key.height &&
+            options.outWidth % (sample * 2) == 0 &&
+            options.outHeight % (sample * 2) == 0) sample *= 2
         options.inSampleSize = sample
         options.inJustDecodeBounds = false
         options.inPreferredConfig = Bitmap.Config.ARGB_8888
         BitmapFactory.decodeFile(key.subjectPath, options)
     }.getOrNull()
-    val applied = if (raw != null && key.flag != 0) runCatching {
-        WallpaperManager.getInstance(context).getWallpaperFile(key.flag)?.use {
-            BitmapFactory.decodeFileDescriptor(it.fileDescriptor)
-        }
-    }.getOrNull() else null
+    val applied = if (raw != null && key.flag != 0) {
+        val wm = WallpaperManager.getInstance(context)
+        fun load(flag: Int): Bitmap? = runCatching {
+            wm.getWallpaperFile(flag)?.use {
+                BitmapFactory.decodeFileDescriptor(it.fileDescriptor)
+            }
+        }.getOrNull()
+        // Match SystemUI's lock-first, system-wallpaper fallback.
+        load(key.flag) ?: if (key.flag == WallpaperManager.FLAG_LOCK)
+            load(WallpaperManager.FLAG_SYSTEM) else null
+    } else null
     return PreviewBitmaps(applied, raw).also {
         // Transient failures must not prevent a later preview from retrying.
         if (raw != null && (key.flag == 0 || applied != null)) cache?.put(key, it)
@@ -107,8 +117,7 @@ internal fun prepareGalleryPreview(context: Context, store: GalleryStore, cache:
     val geometry = CustomClocks.geometry(context)
     val subject = Keys.DEPTH_SUBJECT.read(context)
     if (Keys.DEPTH.read(context) && !subject.isNullOrEmpty()) {
-        val key = depthPreviewKey(context, subject, geometry,
-            Keys.DEPTH_SPATIAL.read(context) && wallpaper.effect == 0)
+        val key = depthPreviewKey(context, subject, geometry, wallpaper.effect == 0)
         loadDepthPreview(context, key, cache)
     }
     photoPreviewKey(wallpaper, geometry.screenWidth, geometry.screenHeight)?.let {

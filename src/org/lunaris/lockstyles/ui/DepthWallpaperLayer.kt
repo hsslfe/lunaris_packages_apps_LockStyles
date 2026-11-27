@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.os.PowerManager
 import androidx.compose.foundation.Canvas
@@ -60,7 +61,6 @@ import org.lunaris.clockmaker.spatial.SpatialWallpaperMotion
 import org.lunaris.lockstyles.ClockStyle
 import org.lunaris.lockstyles.CustomClocks
 import org.lunaris.lockstyles.DynamicClocks
-import org.lunaris.lockstyles.GalleryRenderer
 import org.lunaris.lockstyles.GalleryStore
 import org.lunaris.lockstyles.GalleryWallpaper
 import org.lunaris.lockstyles.settings.Keys
@@ -190,7 +190,7 @@ internal fun rememberDepthPreview(wallpaper: GalleryWallpaper?, enabled: Boolean
     // composition after handing off between the card and the editor.
     val cache = LocalGalleryPreviewCache.current
     val assetKey = depthPreviewKey(context, subjectPath, geometry,
-        spatial && (wallpaper?.effect ?: 0) == 0)
+        (wallpaper?.effect ?: 0) == 0)
     val assets by key(assetKey, cache) {
         produceState(cache?.get(assetKey)) {
             if (value == null) value = withContext(Dispatchers.IO) {
@@ -229,25 +229,50 @@ internal fun Modifier.depthTransform(
     geometry: ClockPreviewGeometry,
     session: DepthPreviewSession?,
 ): Modifier = graphicsLayer {
-    transformOrigin = TransformOrigin(geometry.wallpaperPivotX / geometry.screenWidth,
-        geometry.wallpaperPivotY / geometry.screenHeight)
+    // Both layers must use the same geometry snapshot, even when SystemUI
+    // publishes a new preview geometry during a gallery/editor handoff.
+    val frame = session?.geometry ?: geometry
+    val pivotX = frame.wallpaperPivotX / frame.screenWidth
+    val pivotY = frame.wallpaperPivotY / frame.screenHeight
+    transformOrigin = TransformOrigin(pivotX, pivotY)
     val driver = session?.takeIf { it.spatial }?.driver
-    scaleX = geometry.wallpaperScale * (driver?.scale ?: 1f)
+    val spatialScale = driver?.scale ?: 1f
+    scaleX = frame.wallpaperScale * spatialScale
     scaleY = scaleX
-    val pxPerDpX = geometry.density * size.width / geometry.screenWidth
-    val pxPerDpY = geometry.density * size.height / geometry.screenHeight
+    val pxPerDpX = frame.density * size.width / frame.screenWidth
+    val pxPerDpY = frame.density * size.height / frame.screenHeight
     val offsetX = if (session?.spatial == true) session.offsetX * scaleX else 0f
     val offsetY = if (session?.spatial == true) session.offsetY * scaleY else 0f
-    translationX = ((driver?.horizontal ?: 0f) * 12f + offsetX) * pxPerDpX
-    translationY = ((driver?.vertical ?: 0f) * 9f + offsetY) * pxPerDpY
+    // Spatial overscan is centered before wallpaper zoom, as in SystemUI.
+    val compensation = frame.wallpaperScale * (1f - spatialScale)
+    translationX = ((driver?.horizontal ?: 0f) * 12f + offsetX) * pxPerDpX +
+        compensation * size.width * (0.5f - pivotX)
+    translationY = ((driver?.vertical ?: 0f) * 9f + offsetY) * pxPerDpY +
+        compensation * size.height * (0.5f - pivotY)
 }
 
 @Composable
 internal fun AppliedDepthPhoto(bitmap: Bitmap, modifier: Modifier) {
     val paint = remember { Paint(Paint.FILTER_BITMAP_FLAG) }
+    val matrix = remember { Matrix() }
     Canvas(modifier) {
+        // Match FadeBottomDrawable's cover transform exactly. An integer
+        // source crop shifts or stretches the photo relative to its cutout.
+        val scale = maxOf(size.width / bitmap.width, size.height / bitmap.height)
+        matrix.setScale(scale, scale)
+        matrix.postTranslate(
+            (size.width - bitmap.width * scale) / 2f,
+            (size.height - bitmap.height * scale) / 2f,
+        )
         drawIntoCanvas {
-            GalleryRenderer.drawCentreCrop(it.nativeCanvas, bitmap, size.width, size.height, paint)
+            val canvas = it.nativeCanvas
+            val saved = canvas.save()
+            canvas.clipRect(0f, 0f, size.width, size.height)
+            try {
+                canvas.drawBitmap(bitmap, matrix, paint)
+            } finally {
+                canvas.restoreToCount(saved)
+            }
         }
     }
 }

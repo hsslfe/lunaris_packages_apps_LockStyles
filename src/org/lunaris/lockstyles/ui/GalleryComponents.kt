@@ -530,7 +530,6 @@ fun LockScreenCard(
 ) {
     val shape = RoundedCornerShape(corner.coerceAtLeast(0.dp))
     val onLight = rememberTopLight(wallpaper)
-    var clockBottom by remember(clock.face, clock.small, dynamicClock) { mutableStateOf<ClockPreviewBounds?>(null) }
     BoxWithConstraints(
         modifier
             .clip(shape)
@@ -542,17 +541,21 @@ fun LockScreenCard(
                 LockScreenWallpaper(wallpaper, Modifier.fillMaxSize(), live && wallpaper.isAnimated, weather)
                 val lockscreenWeather = rememberLockscreenWeather()
                 val fallbackWeather by Keys.CUSTOM_CLOCK_WEATHER.state()
-                val embeddedWeather = if (clock.face == 0) fallbackWeather
-                    else clock.tuning?.weather ?: fallbackWeather
+                val context = LocalContext.current
+                val tuning = clock.tuning ?: remember(context) { CustomClocks.Tuning.load(context) }
+                val embeddedWeather = if (clock.face == 0) fallbackWeather else tuning.weather
+                val (clockBottom, onClockBottomChanged) = rememberClockPreviewBounds(
+                    clock, tuning, dynamicClock, embeddedWeather)
                 if (clock.face > 0 || dynamicClock) {
-                    CustomClockLayer(clock, wallpaper = wallpaper, onBottomChanged = { clockBottom = it },
+                    CustomClockLayer(clock, tuning = tuning, wallpaper = wallpaper,
+                        onBottomChanged = onClockBottomChanged,
                         lockscreenWeather = lockscreenWeather.takeIf { embeddedWeather })
                 } else {
                     val clockHeight = maxHeight * if (clock.small) 0.06f else 0.24f
                     val dateSize = (maxWidth.value * 0.055f).sp
                     Column(
                         Modifier.fillMaxWidth().onSizeChanged {
-                            clockBottom = ClockPreviewBounds(it.height.toFloat(), it.height.toFloat())
+                            onClockBottomChanged(ClockPreviewBounds(it.height.toFloat(), it.height.toFloat()))
                         }
                             .padding(top = maxHeight * 0.1f),
                         horizontalAlignment = Alignment.CenterHorizontally,

@@ -221,7 +221,6 @@ private fun CustomiseContent(
     ImmersiveEffect(fullScreen)
     var askHome by remember { mutableStateOf(false) }
     var weather by remember { mutableStateOf<GalleryWeather.Snapshot?>(null) }
-    var clockBottom by remember(clock.face, clock.small) { mutableStateOf<ClockPreviewBounds?>(null) }
     if (showDynamicClock) {
         DynamicClockScreen(dynamicClock, wallpaper, initial.id, allowPhotoPicking,
             onCancel = { showDynamicClock = false }, onSave = {
@@ -261,9 +260,11 @@ private fun CustomiseContent(
                 val fallbackWeather by Keys.CUSTOM_CLOCK_WEATHER.state()
                 val embeddedWeather = if (previewClock.face == 0) fallbackWeather
                     else previewTuning.weather
+                val (clockBottom, onClockBottomChanged) = rememberClockPreviewBounds(
+                    previewClock, previewTuning, previewDynamic, embeddedWeather)
                 if (previewClock.face > 0 || previewDynamic) {
                     CustomClockLayer(previewClock, tuning = previewTuning, wallpaper = wallpaper,
-                        immediatePreview = true, onBottomChanged = { clockBottom = it },
+                        immediatePreview = true, onBottomChanged = onClockBottomChanged,
                         lockscreenWeather = lockscreenWeather.takeIf { embeddedWeather })
                     Box(Modifier.fillMaxWidth().fillMaxHeight(0.3f)
                         .semantics { contentDescription = editClockLabel }
@@ -273,7 +274,7 @@ private fun CustomiseContent(
                     val dateSize = (maxWidth.value * 0.055f).sp
                     Column(
                         Modifier.fillMaxWidth().onSizeChanged {
-                            clockBottom = ClockPreviewBounds(it.height.toFloat(), it.height.toFloat())
+                            onClockBottomChanged(ClockPreviewBounds(it.height.toFloat(), it.height.toFloat()))
                         }
                             .padding(top = maxHeight * 0.1f),
                         horizontalAlignment = Alignment.CenterHorizontally,

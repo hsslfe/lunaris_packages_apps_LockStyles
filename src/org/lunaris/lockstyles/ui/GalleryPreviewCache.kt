@@ -11,9 +11,17 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.util.LruCache
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import java.io.File
 import org.lunaris.clockmaker.ClockPreviewGeometry
+import org.lunaris.lockstyles.ClockStyle
 import org.lunaris.lockstyles.CustomClocks
 import org.lunaris.lockstyles.GalleryRenderer
 import org.lunaris.lockstyles.GalleryStore
@@ -29,11 +37,53 @@ internal class GalleryPreviewCache {
                 (value.foreground?.allocationByteCount ?: 0)
     }
 
+    private val clockBounds = LruCache<ClockBoundsKey, ClockPreviewBounds>(32)
+
+    internal fun getClockBounds(key: ClockBoundsKey): ClockPreviewBounds? = clockBounds.get(key)
+    internal fun putClockBounds(key: ClockBoundsKey, bounds: ClockPreviewBounds) {
+        clockBounds.put(key, bounds)
+    }
+
     fun get(key: Any): PreviewBitmaps? = entries.get(key)
     fun put(key: Any, value: PreviewBitmaps) { entries.put(key, value) }
 }
 
 internal val LocalGalleryPreviewCache = staticCompositionLocalOf<GalleryPreviewCache?> { null }
+
+internal data class ClockBoundsKey(
+    val clock: ClockStyle,
+    val dynamic: Boolean,
+    val embeddedWeather: Boolean,
+    val geometry: ClockPreviewGeometry,
+    val assetsSeq: Int,
+    val fontScale: Float,
+)
+
+// LockScreenPreviewLayout measures all three owners in full-screen scene pixels,
+// regardless of the outer card's zoom. Seed a new owner with the last measured
+// anchor so dependent layers can draw with the clock on the first frame.
+@Composable
+internal fun rememberClockPreviewBounds(
+    clock: ClockStyle,
+    tuning: CustomClocks.Tuning,
+    dynamic: Boolean,
+    embeddedWeather: Boolean,
+): Pair<ClockPreviewBounds?, (ClockPreviewBounds) -> Unit> {
+    val cache = LocalGalleryPreviewCache.current
+    val geometry = CustomClocks.geometry(LocalContext.current)
+    val configuration = LocalConfiguration.current
+    val key = ClockBoundsKey(clock.copy(tuning = tuning), dynamic, embeddedWeather,
+        geometry, configuration.assetsSeq, configuration.fontScale)
+    // Keep the current anchor during live tuning edits until the clock reports
+    // its new bounds. Never borrow bounds from a different clock or scene.
+    var bounds by remember(cache, clock.face, clock.small, dynamic, geometry) {
+        mutableStateOf(cache?.getClockBounds(key))
+    }
+    return bounds to { measured ->
+        bounds = measured
+        cache?.putClockBounds(key, measured)
+    }
+}
 internal data class PreviewBitmaps(val background: Bitmap?, val foreground: Bitmap? = null)
 
 internal data class PhotoPreviewKey(

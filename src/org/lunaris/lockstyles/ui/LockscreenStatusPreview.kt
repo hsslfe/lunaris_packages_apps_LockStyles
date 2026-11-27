@@ -110,7 +110,17 @@ private fun BindStatusPreview(data: StatusPreviewData) {
             try {
                 updates.trySend(Unit)
                 for (event in updates) {
-                    data.weather = withContext(Dispatchers.IO) { readWeather(context, client) }
+                    val previous = data.weather
+                    data.weather = withContext(Dispatchers.IO) {
+                        val reading = readWeather(context, client)
+                        val previousIcon = previous?.icon
+                        val icon = reading?.icon
+                        // Identical provider updates must not invalidate the shared
+                        // clock bitmap just as a new preview owner takes over.
+                        if (reading != null && icon != null && previousIcon != null &&
+                            icon.sameAs(previousIcon)) reading.copy(icon = previousIcon)
+                        else reading
+                    }
                 }
             } finally {
                 if (observing) runCatching { client.removeObserver(context, observer) }

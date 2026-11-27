@@ -87,6 +87,8 @@ import org.lunaris.lockstyles.GalleryWallpaper
 import org.lunaris.lockstyles.GalleryWeather
 import org.lunaris.lockstyles.StockClock
 import org.lunaris.lockstyles.settings.ExtraInfoSettings
+import org.lunaris.lockstyles.settings.Keys
+import org.lunaris.lockstyles.settings.state
 import org.lunaris.lockstyles.settings.ExtraInfoSettingsProvider
 import org.lunaris.lockstyles.settings.ui.components.squishable
 
@@ -407,6 +409,7 @@ fun CustomClockLayer(
     wallpaper: GalleryWallpaper? = null,
     homeScreen: Boolean = false,
     immediatePreview: Boolean = false,
+    lockscreenWeather: CustomClocks.PreviewWeather? = null,
 ) {
     val context = LocalContext.current
     val fallbackTuning = remember { CustomClocks.Tuning.load(context) }
@@ -434,9 +437,10 @@ fun CustomClockLayer(
     val assetsSeq = configuration.assetsSeq
     val minute = previewMinute()
     val stockStyle = style.takeIf { it.face == 0 }
+    val inlineWeather = lockscreenWeather.takeIf { !homeScreen }
     fun renderPreview() = CustomClocks.preview(context, style.face, frame.width, color,
         tuning = currentTuning, glassBackground = glass, homeScreen = homeScreen,
-        font = style.font, stockStyle = stockStyle)
+        font = style.font, stockStyle = stockStyle, weather = inlineWeather)
 
     // The pager, moving card and editor have separate compositions. Seed each
     // with the same full-size cached clock instead of drawing an empty frame.
@@ -444,12 +448,12 @@ fun CustomClockLayer(
     var preview by remember {
         mutableStateOf(if (holdForGlass) null else
             CustomClocks.cachedPreview(context, style.face, frame.width, color,
-                currentTuning, glass, homeScreen, style.font, stockStyle)
+                currentTuning, glass, homeScreen, style.font, stockStyle, inlineWeather)
                 ?: if (immediatePreview) renderPreview() else null)
     }
     LaunchedEffect(style.face, style.font, style.small, style.preset,
         style.rounded, style.stockAxes, color, frame.width, currentTuning,
-        glass, holdForGlass, assetsSeq, homeScreen, geometry, minute) {
+        glass, holdForGlass, assetsSeq, homeScreen, geometry, minute, inlineWeather) {
         preview = if (holdForGlass) null else renderPreview()
     }
     BoxWithConstraints(modifier.fillMaxSize()) {
@@ -536,8 +540,13 @@ fun LockScreenCard(
         LockScreenPreviewLayout(Modifier.fillMaxSize(), depthWallpaper = wallpaper, showDepth = true) {
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 LockScreenWallpaper(wallpaper, Modifier.fillMaxSize(), live && wallpaper.isAnimated, weather)
+                val lockscreenWeather = rememberLockscreenWeather()
+                val fallbackWeather by Keys.CUSTOM_CLOCK_WEATHER.state()
+                val embeddedWeather = if (clock.face == 0) fallbackWeather
+                    else clock.tuning?.weather ?: fallbackWeather
                 if (clock.face > 0 || dynamicClock) {
-                    CustomClockLayer(clock, wallpaper = wallpaper, onBottomChanged = { clockBottom = it })
+                    CustomClockLayer(clock, wallpaper = wallpaper, onBottomChanged = { clockBottom = it },
+                        lockscreenWeather = lockscreenWeather.takeIf { embeddedWeather })
                 } else {
                     val clockHeight = maxHeight * if (clock.small) 0.06f else 0.24f
                     val dateSize = (maxWidth.value * 0.055f).sp
@@ -557,11 +566,14 @@ fun LockScreenCard(
                         ClockText(clock, clockHeight, fixedTime = fixedTime, onLight = onLight)
                     }
                 }
-                DepthWallpaperLayer(wallpaper)
+                val weatherBottom = WeatherWallpaperLayer(clockBottom?.layoutBottom,
+                    lockscreenWeather, embeddedWeather)
                 ExtraInfoSettingsProvider(extraInfo) {
+                    val legacyBottom = if (showExtraInfo) DeviceInfoWallpaperLayer(weatherBottom)
+                        else weatherBottom
+                    DepthWallpaperLayer(wallpaper)
                     val infoBottom = if (showExtraInfo)
-                        ExtraInfoWallpaperLayer(clockBottom?.layoutBottom, wallpaper)
-                        else clockBottom?.layoutBottom
+                        ExtraInfoWallpaperLayer(legacyBottom, wallpaper) else legacyBottom
                     AppWidgetWallpaperLayer(infoBottom, clockBottom)
                     if (showExtraInfo) IndependentInfoWallpaperLayer(wallpaper)
                 }

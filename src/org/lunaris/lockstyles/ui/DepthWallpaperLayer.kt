@@ -102,8 +102,9 @@ internal fun GalleryPreviewScope(cache: GalleryPreviewCache, content: @Composabl
     CompositionLocalProvider(
         LocalGalleryPreviewCache provides cache,
         LocalGalleryDepthMotion provides shared,
-        content = content,
-    )
+    ) {
+        LockscreenStatusPreviewScope(content)
+    }
 }
 
 /** Keep one sensor listener for the shared scene and stop it as soon as it is no longer visible. */

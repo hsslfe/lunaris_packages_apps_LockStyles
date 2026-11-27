@@ -144,6 +144,8 @@ import org.lunaris.lockstyles.LockScreen
 import org.lunaris.lockstyles.R
 import org.lunaris.lockstyles.Shortcuts
 import org.lunaris.lockstyles.settings.ExtraInfoSettingsProvider
+import org.lunaris.lockstyles.settings.Keys
+import org.lunaris.lockstyles.settings.state
 import org.lunaris.lockstyles.settings.ui.AodAvatarSettings
 import org.lunaris.lockstyles.settings.ui.AppWidgetsBottomSheet
 import org.lunaris.lockstyles.settings.ui.ClockFontPicker
@@ -255,9 +257,14 @@ private fun CustomiseContent(
                 val previewDynamic = dynamicClock.enabled && !(panelOpen && tab == CustomizerTab.CLOCK)
                 val previewClock = if (previewDynamic) dynamicClock.large else clock
                 val previewTuning = if (previewDynamic) previewClock.tuning ?: tuning else tuning
+                val lockscreenWeather = rememberLockscreenWeather()
+                val fallbackWeather by Keys.CUSTOM_CLOCK_WEATHER.state()
+                val embeddedWeather = if (previewClock.face == 0) fallbackWeather
+                    else previewTuning.weather
                 if (previewClock.face > 0 || previewDynamic) {
                     CustomClockLayer(previewClock, tuning = previewTuning, wallpaper = wallpaper,
-                        immediatePreview = true, onBottomChanged = { clockBottom = it })
+                        immediatePreview = true, onBottomChanged = { clockBottom = it },
+                        lockscreenWeather = lockscreenWeather.takeIf { embeddedWeather })
                     Box(Modifier.fillMaxWidth().fillMaxHeight(0.3f)
                         .semantics { contentDescription = editClockLabel }
                         .clickable(onClickLabel = editClockLabel) { openPanel(CustomizerTab.CLOCK) })
@@ -287,8 +294,11 @@ private fun CustomiseContent(
                     }
                 }
 
+                val weatherBottom = WeatherWallpaperLayer(clockBottom?.layoutBottom,
+                    lockscreenWeather, embeddedWeather)
+                val legacyBottom = DeviceInfoWallpaperLayer(weatherBottom)
                 DepthWallpaperLayer(wallpaper)
-                val infoBottom = ExtraInfoWallpaperLayer(clockBottom?.layoutBottom, wallpaper)
+                val infoBottom = ExtraInfoWallpaperLayer(legacyBottom, wallpaper)
                 AppWidgetWallpaperLayer(infoBottom, clockBottom)
                 IndependentInfoWallpaperLayer(wallpaper, fullScreen)
             }

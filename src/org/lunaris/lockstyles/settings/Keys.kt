@@ -33,6 +33,7 @@ object Keys {
     // Weather
     val SMARTSPACE = Bool(SECURE, "lockscreen_smartspace_enabled", true)
     val WEATHER = Bool(SYSTEM, "lockscreen_weather_enabled", false)
+    val CUSTOM_CLOCK_WEATHER = Bool(SECURE, "custom_clock_weather", true)
     val WEATHER_LOCATION = Bool(SYSTEM, "lockscreen_weather_location", false)
     val WEATHER_TEXT = Bool(SYSTEM, "lockscreen_weather_text", true)
     val WEATHER_WIND = Bool(SYSTEM, "lockscreen_weather_wind_info", false)

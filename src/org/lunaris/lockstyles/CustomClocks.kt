@@ -21,6 +21,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextClock
 import android.widget.TextView
 import org.json.JSONObject
@@ -448,22 +449,24 @@ object CustomClocks {
         )
     }
 
+    data class PreviewWeather(val text: String, val icon: Bitmap?)
+
     private fun previewKey(context: Context, style: Int, width: Int, color: Int?,
             trim: Boolean, tuning: Tuning?, glassBackground: ClockGlass?, homeScreen: Boolean,
-            font: String?, stockStyle: ClockStyle?): String {
+            font: String?, stockStyle: ClockStyle?, weather: PreviewWeather?): String {
         val minute = System.currentTimeMillis() / 60_000
         val assetsSeq = context.resources.configuration.assetsSeq
         val geometry = geometry(context, homeScreen)
         val stockKey = stockStyle?.let { "${it.small}/${it.preset}/${it.rounded}/${it.stockAxes}" }.orEmpty()
-        return "$style/$width/$color/$minute/$trim/$tuning/$assetsSeq/$homeScreen/$geometry/$font/$stockKey/${System.identityHashCode(glassBackground)}"
+        return "$style/$width/$color/$minute/$trim/$tuning/$assetsSeq/$homeScreen/$geometry/$font/$stockKey/${System.identityHashCode(glassBackground)}/${weather?.text}/${System.identityHashCode(weather?.icon)}"
     }
 
     // A new preview owner can display an already rendered clock on its first frame.
     internal fun cachedPreview(context: Context, style: Int, width: Int, color: Int?,
             tuning: Tuning?, glassBackground: ClockGlass?, homeScreen: Boolean,
-            font: String?, stockStyle: ClockStyle?): Bitmap? =
+            font: String?, stockStyle: ClockStyle?, weather: PreviewWeather? = null): Bitmap? =
         previews.get(previewKey(context, style, width, color, false, tuning, glassBackground,
-            homeScreen, font, stockStyle))
+            homeScreen, font, stockStyle, weather))
 
     /**
      * The style drawn at [width] pixels with the current time, or null for the default clock.
@@ -471,17 +474,19 @@ object CustomClocks {
      */
     fun preview(context: Context, style: Int, width: Int, color: Int?,
             trim: Boolean = false, tuning: Tuning? = null, glassBackground: ClockGlass? = null,
-            homeScreen: Boolean = false, font: String? = null, stockStyle: ClockStyle? = null): Bitmap? {
+            homeScreen: Boolean = false, font: String? = null, stockStyle: ClockStyle? = null,
+            weather: PreviewWeather? = null): Bitmap? {
         if (style < 0) return null
         val geometry = geometry(context, homeScreen)
         val key = previewKey(context, style, width, color, trim, tuning, glassBackground,
-            homeScreen, font, stockStyle)
+            homeScreen, font, stockStyle, weather)
         previews.get(key)?.let { return it }
         val cat = load(context) ?: return null
         if (style >= cat.layouts.size) return null
         return try {
             val inflater = LayoutInflater.from(cat.inflateContext).cloneInContext(
-                cat.inflateContext).apply { factory2 = SystemUiViews(cat.systemUi?.classLoader) }
+                cat.inflateContext).apply { factory2 = SystemUiViews(cat.systemUi?.classLoader,
+                    weather.takeIf { !homeScreen }) }
             val view = if (style == 0) inflateStockClock(context, cat,
                 stockStyle ?: ClockStyle(), color) else inflater.inflate(cat.layouts[style], null)
             if (style != 0) prepare(view, if (isColourable(style)) color ?: Color.WHITE else null,
@@ -636,15 +641,39 @@ object CustomClocks {
      * SystemUI's clock views only need a context, so they're loaded from its code. Its other
      * views (weather and the like) need SystemUI itself; plain views keep the layout's shape.
      */
-    private class SystemUiViews(private val loader: ClassLoader?) : LayoutInflater.Factory2 {
+    private class SystemUiViews(private val loader: ClassLoader?,
+            private val weather: PreviewWeather?) : LayoutInflater.Factory2 {
         override fun onCreateView(parent: View?, name: String, context: Context,
                 attrs: AttributeSet): View? {
             if (!name.contains('.') || name.startsWith("android.")) return null
             if (name == "$SYSTEMUI.clocks.AlignedTextClock") {
                 return AlignedPreviewTextClock(context, attrs)
             }
-            // Weather controllers depend on SystemUI's process-local Dependency singleton.
-            // Use the plain placeholders below without constructing those controllers.
+            // Render the weather values in the original clock's XML positions without
+            // constructing the SystemUI-only controllers in the LockStyles process.
+            if (name == "$SYSTEMUI.weather.WeatherImageView") {
+                val res = context.resources
+                val id = res.getIdentifier("weather_image_max_size", "dimen", SYSTEMUI)
+                val size = if (id != 0) res.getDimensionPixelSize(id)
+                    else (24f * res.displayMetrics.density).roundToInt()
+                return object : ImageView(context, attrs) {
+                    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                        setMeasuredDimension(resolveSize(size, widthMeasureSpec),
+                            resolveSize(size, heightMeasureSpec))
+                    }
+                }.apply {
+                    setImageBitmap(weather?.icon)
+                    visibility = if (weather != null) View.VISIBLE else View.GONE
+                }
+            }
+            if (name == "$SYSTEMUI.weather.WeatherTextView") {
+                return TextView(context, attrs).apply {
+                    text = weather?.text.orEmpty()
+                    visibility = if (weather != null) View.VISIBLE else View.GONE
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                }
+            }
             if (loader != null && name.startsWith("$SYSTEMUI.") &&
                     !name.startsWith("$SYSTEMUI.weather.")) {
                 try {

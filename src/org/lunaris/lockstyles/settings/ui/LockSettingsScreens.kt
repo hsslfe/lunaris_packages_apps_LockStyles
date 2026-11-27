@@ -51,6 +51,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -66,6 +67,8 @@ import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -157,14 +160,56 @@ private fun strings(): (Int) -> String {
 }
 
 @Composable
-private fun MainPage(open: (Page) -> Unit, back: () -> Unit) {
+private fun lockscreenWeatherRows(): List<@Composable (RowShape) -> Unit> {
     val s = strings()
     val context = LocalContext.current
     val askRestart = LocalAskRestart.current
     val smartspace by Keys.SMARTSPACE.state()
-    val omniJaws = remember { Lunaris.isOmniJawsEnabled(context) }
     val weatherOn by Keys.WEATHER.state()
+    val lifecycle = rememberWidgetLifecycle()
+    var omniJaws by remember(context) { mutableStateOf(Lunaris.isOmniJawsEnabled(context)) }
+    DisposableEffect(context, lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                omniJaws = Lunaris.isOmniJawsEnabled(context)
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     val weatherAvailable = !smartspace && omniJaws
+    return listOf(
+        switchRow(s(R.string.lockscreen_smartspace_title),
+            s(R.string.lockscreen_smartspace_summary), Keys.SMARTSPACE) { askRestart() },
+        navRow(s(R.string.weather_settings_title), s(R.string.weather_settings_summary),
+            enabled = Lunaris.isInstalled(context, "org.omnirom.omnijaws")) {
+            runCatching { context.startActivity(Lunaris.omniJawsSettings()) }
+        },
+        switchRow(s(R.string.lockscreen_weather_title),
+            if (weatherAvailable) s(R.string.lockscreen_weather_summary)
+            else s(R.string.lockscreen_weather_enabled_info),
+            Keys.WEATHER, enabled = weatherAvailable) { askRestart() },
+        switchRow(s(R.string.lockscreen_weather_location_title),
+            s(R.string.lockscreen_weather_location_summary), Keys.WEATHER_LOCATION,
+            enabled = weatherOn),
+        switchRow(s(R.string.lockscreen_weather_text_title),
+            s(R.string.lockscreen_weather_text_summary), Keys.WEATHER_TEXT,
+            enabled = weatherOn),
+        switchRow(s(R.string.lockscreen_weather_wind_info_title),
+            s(R.string.lockscreen_weather_wind_info_summary), Keys.WEATHER_WIND,
+            enabled = weatherOn),
+        switchRow(s(R.string.lockscreen_weather_humidity_info_title),
+            s(R.string.lockscreen_weather_humidity_info_summary), Keys.WEATHER_HUMIDITY,
+            enabled = weatherOn),
+    )
+}
+
+@Composable
+private fun MainPage(open: (Page) -> Unit, back: () -> Unit) {
+    val s = strings()
+    val context = LocalContext.current
+    val askRestart = LocalAskRestart.current
+    val weatherRows = lockscreenWeatherRows()
     val fingerprint = remember { Lunaris.hasFingerprint(context) }
     val vibrator = remember { Lunaris.hasVibrator(context) }
 
@@ -243,30 +288,7 @@ private fun MainPage(open: (Page) -> Unit, back: () -> Unit) {
                 askRestart()
             },
         ))
-        group(s(R.string.lockscreen_weather_category), Icons.Rounded.WbSunny, listOf(
-            switchRow(s(R.string.lockscreen_smartspace_title),
-                s(R.string.lockscreen_smartspace_summary), Keys.SMARTSPACE) { askRestart() },
-            navRow(s(R.string.weather_settings_title), s(R.string.weather_settings_summary),
-                enabled = Lunaris.isInstalled(context, "org.omnirom.omnijaws")) {
-                runCatching { context.startActivity(Lunaris.omniJawsSettings()) }
-            },
-            switchRow(s(R.string.lockscreen_weather_title),
-                if (weatherAvailable) s(R.string.lockscreen_weather_summary)
-                else s(R.string.lockscreen_weather_enabled_info),
-                Keys.WEATHER, enabled = weatherAvailable) { askRestart() },
-            switchRow(s(R.string.lockscreen_weather_location_title),
-                s(R.string.lockscreen_weather_location_summary), Keys.WEATHER_LOCATION,
-                enabled = weatherOn),
-            switchRow(s(R.string.lockscreen_weather_text_title),
-                s(R.string.lockscreen_weather_text_summary), Keys.WEATHER_TEXT,
-                enabled = weatherOn),
-            switchRow(s(R.string.lockscreen_weather_wind_info_title),
-                s(R.string.lockscreen_weather_wind_info_summary), Keys.WEATHER_WIND,
-                enabled = weatherOn),
-            switchRow(s(R.string.lockscreen_weather_humidity_info_title),
-                s(R.string.lockscreen_weather_humidity_info_summary), Keys.WEATHER_HUMIDITY,
-                enabled = weatherOn),
-        ))
+        group(s(R.string.lockscreen_weather_category), Icons.Rounded.WbSunny, weatherRows)
         group(s(R.string.gestures_title), Icons.Rounded.Gesture, buildList {
             add(switchRow(s(R.string.lockscreen_doubletap_sleep_title),
                 s(R.string.lockscreen_doubletap_sleep_summary), Keys.DOUBLE_TAP_SLEEP))
@@ -364,8 +386,10 @@ fun WidgetsPage(back: () -> Unit, inSheet: Boolean = false, preview: LockScreen?
     val info by Keys.INFO_WIDGETS.state()
     val extraInfo by Keys.EXTRA_INFO_WIDGETS.state()
     val widgets by Keys.WIDGETS.state()
+    val weatherRows = if (inSheet) lockscreenWeatherRows() else emptyList()
     var appWidgetsOpen by remember { mutableStateOf(false) }
     SettingsPage(s(R.string.lockscreen_widgets_title), back, inSheet) {
+        if (inSheet) group(s(R.string.lockscreen_weather_category), Icons.Rounded.WbSunny, weatherRows)
         group(null, listOf(
             navRow(s(org.lunaris.lockscreenwidgets.R.string.app_widgets_title),
                 s(R.string.app_widget_browse), Icons.Rounded.Widgets) {
@@ -383,11 +407,11 @@ fun WidgetsPage(back: () -> Unit, inSheet: Boolean = false, preview: LockScreen?
             WidgetColorGroup(options(R.array.lockscreen_custom_clock_color_mode_entries,
                 R.array.lockscreen_custom_clock_color_mode_values), info || extraInfo)
         }
+        if (info || extraInfo) group(null, listOf(
+            sliderRow(s(R.string.lockscreen_widgets_transparency_title), null,
+                Keys.WIDGETS_TRANSPARENCY, 0..100, unit = "%"),
+        ))
         if (extraInfo) {
-            group(null, listOf(
-                sliderRow(s(R.string.lockscreen_widgets_transparency_title), null,
-                    Keys.WIDGETS_TRANSPARENCY, 0..100, unit = "%"),
-            ))
             item { InfoWidgetBackgroundPreference() }
             item { ExtraInfoWidgetsPanel(preview) }
         }
